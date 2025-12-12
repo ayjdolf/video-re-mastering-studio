@@ -1,0 +1,6 @@
+streamlit
+pandas
+openai-whisper
+opencv-python-headless
+moviepy
+google-generativeai
