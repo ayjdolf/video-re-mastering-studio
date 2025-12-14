@@ -1,338 +1,318 @@
 import streamlit as st
-import streamlit.components.v1 as components
-import time
-import os
-import pandas as pd
-import whisper
 import cv2
+import os
+import shutil
 import numpy as np
-import zipfile
-import io
-import sys
-import subprocess
+import pandas as pd
+import google.generativeai as genai
 from moviepy.editor import VideoFileClip
 
-# --- [특단의 조치] 라이브러리 자동 설치 & 업데이트 ---
-# 프로그램 시작 시 자동으로 최신 버전을 설치합니다.
-try:
-    import google.generativeai as genai
-    # 버전이 너무 낮으면 404 에러가 나므로 강제 업데이트 시도
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "-U", "google-generativeai"])
-    import google.generativeai as genai
-except ImportError:
-    st.warning("⚠️ AI 부품이 없어서 설치 중입니다... 잠시만 기다려주세요!")
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "-U", "google-generativeai"])
-    import google.generativeai as genai
-    st.success("✅ 설치 완료! 자동으로 다시 시작됩니다.")
-    time.sleep(1)
-    st.rerun()
+# ==========================================
+# 1. 환경 설정
+# ==========================================
+BASE_DIR = os.getcwd()
+TEMP_DIR = os.path.join(BASE_DIR, "temp_workspace")
+OUTPUT_DIR = os.path.join(BASE_DIR, "extracted_scenes")
+PPT_DIR = os.path.join(BASE_DIR, "uploaded_ppts")
+AUDIO_PATH = os.path.join(TEMP_DIR, "audio.mp3")
 
-# --- 기본 설정 ---
-st.set_page_config(page_title="AI 영상 리마스터링 스튜디오", layout="wide")
+# ==========================================
+# 2. 핵심 분석 엔진 (Track 1 & Track 2)
+# ==========================================
 
-if not os.path.exists("extracted_slides"):
-    os.makedirs("extracted_slides")
-
-# --- 세션 상태 ---
-if 'script_df' not in st.session_state:
-    st.session_state.script_df = None
-if 'slides_data' not in st.session_state:
-    st.session_state.slides_data = None
-if 'storyboard_df' not in st.session_state:
-    st.session_state.storyboard_df = None
-
-# --- 스크롤 함수 ---
-def scroll_to_bottom():
-    js = """
-    <script>
-        var body = window.parent.document.body;
-        setTimeout(function() {
-            window.parent.scrollTo(0, body.scrollHeight);
-        }, 500);
-    </script>
-    """
-    components.html(js, height=0)
-
-# --- 기능 함수들 ---
-def extract_audio(video_path):
-    audio_path = "temp_audio.mp3"
-    try:
-        video = VideoFileClip(video_path)
-        video.audio.write_audiofile(audio_path, codec='mp3', logger=None)
-        return audio_path
-    except Exception as e:
-        return None
-
-@st.cache_resource
-def load_whisper_model():
-    return whisper.load_model("base") 
-
-def analyze_audio(audio_path, model):
-    result = model.transcribe(audio_path)
-    return result['segments']
-
-def analyze_scenes(video_path, cut_x_ratio, cut_y_ratio, sensitivity, min_interval):
+# [Track 1] PPT 원본과 비교해서 장면 찾기 (매칭 모드)
+def extract_scenes_by_matching(video_path, ppt_files, progress_bar):
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    duration = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) / fps if fps > 0 else 0
     
-    saved_slides = []
-    last_saved_frame = None 
-    last_saved_time = -999 
+    # PPT 이미지 미리 로드 및 전처리
+    ppt_imgs = []
+    ppt_filenames = []
     
-    interval = int(fps) 
-    progress_bar = st.progress(0)
+    # 영상 크기에 맞춰 PPT 리사이징을 위해 첫 프레임 읽기
+    ret, first_frame = cap.read()
+    if not ret: return []
+    h_vid, w_vid = first_frame.shape[:2]
     
-    for i, frame_idx in enumerate(range(0, total_frames, interval)):
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+    # 업로드된 PPT 읽어서 메모리에 올리기
+    sorted_ppts = sorted(ppt_files, key=lambda x: x.name) # 이름순 정렬
+    for p_file in sorted_ppts:
+        # 파일 저장 후 읽기
+        p_path = os.path.join(PPT_DIR, p_file.name)
+        with open(p_path, "wb") as f: f.write(p_file.getbuffer())
+        
+        img = cv2.imread(p_path)
+        if img is not None:
+            # 영상 크기와 똑같이 리사이징 (비교를 위해)
+            img_resized = cv2.resize(img, (w_vid, h_vid))
+            gray_ppt = cv2.cvtColor(img_resized, cv2.COLOR_BGR2GRAY)
+            ppt_imgs.append(gray_ppt)
+            ppt_filenames.append(p_file.name)
+
+    if not ppt_imgs: return []
+
+    scene_data = []
+    current_ppt_idx = 0
+    last_match_time = -999
+    
+    status = st.empty()
+    status.write(f"🧩 PPT {len(ppt_imgs)}장과 영상 매칭 시작...")
+
+    # 영상 스캔 (속도를 위해 0.5초 단위로 건너뛰며 스캔)
+    step_frames = int(fps * 0.5) 
+    
+    while True:
+        # 프레임 건너뛰기
+        for _ in range(step_frames): cap.grab()
         ret, frame = cap.read()
-        if not ret:
-            break
-            
-        if i % 10 == 0:
-            progress_bar.progress(frame_idx / total_frames)
-            
-        current_time = frame_idx / fps
+        if not ret: break
+        
+        current_time = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+        if duration > 0: progress_bar.progress(min(int((current_time/duration)*40), 40))
 
-        if (current_time - last_saved_time) < min_interval:
-            continue
+        # 현재 프레임 흑백 변환
+        frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-        h, w, _ = frame.shape
+        # 현재 보고 있는 PPT와 다음 PPT랑 비교
+        # 로직: "현재 PPT보다 다음 PPT랑 더 비슷해지면 넘어간 걸로 간주"
         
-        # Masking
-        analyze_frame = frame.copy()
-        x_start = int(w * cut_x_ratio)
-        y_start = int(h * cut_y_ratio)
-        analyze_frame[y_start:h, x_start:w] = 0
+        score_current = 0
+        score_next = 0
         
-        # Change Detection
-        gray = cv2.cvtColor(analyze_frame, cv2.COLOR_BGR2GRAY)
-        gray = cv2.GaussianBlur(gray, (5, 5), 0)
+        # 현재 PPT와 유사도 (구조적 유사도 대신 간단히 픽셀 차이 역수 사용)
+        diff_curr = np.mean(cv2.absdiff(frame_gray, ppt_imgs[current_ppt_idx]))
+        score_current = 100 - diff_curr # 차이가 작을수록 점수 높음
         
-        is_new_slide = False
-        
-        if last_saved_frame is None:
-            is_new_slide = True 
-        else:
-            score = cv2.absdiff(last_saved_frame, gray)
-            score_mean = np.mean(score)
+        # 다음 PPT가 있다면 비교
+        if current_ppt_idx < len(ppt_imgs) - 1:
+            diff_next = np.mean(cv2.absdiff(frame_gray, ppt_imgs[current_ppt_idx+1]))
+            score_next = 100 - diff_next
             
-            if score_mean > sensitivity: 
-                is_new_slide = True
-        
-        if is_new_slide:
-            filename = f"extracted_slides/slide_{int(current_time)}.jpg"
-            
-            debug_frame = frame.copy()
-            cv2.rectangle(debug_frame, (0, 0), (w, h), (0, 255, 0), 2)
-            cv2.rectangle(debug_frame, (x_start, y_start), (w, h), (0, 0, 255), -1)
-            cv2.putText(debug_frame, "IGNORED", (x_start + 10, y_start + 30), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-            
-            cv2.imwrite(filename, debug_frame) 
-            
-            saved_slides.append({
-                "시간": time.strftime('%H:%M:%S', time.gmtime(current_time)),
-                "초": current_time,
-                "파일명": filename
-            })
-            
-            last_saved_frame = gray 
-            last_saved_time = current_time 
-            
+            # 다음 PPT랑 훨씬 더 비슷해지면 인덱스 변경 (장면 전환)
+            # 10점 이상 차이나면 확실하게 넘어간 것
+            if score_next > score_current + 10: 
+                current_ppt_idx += 1
+                
+                # 결과 저장
+                save_name = f"match_scene_{current_ppt_idx+1:02d}.jpg"
+                save_path = os.path.join(OUTPUT_DIR, save_name)
+                cv2.imwrite(save_path, frame) # 영상 프레임 저장
+                
+                # 혹은 원본 PPT를 결과로 쓰고 싶다면 아래 주석 해제
+                # cv2.imwrite(save_path, cv2.imread(os.path.join(PPT_DIR, ppt_filenames[current_ppt_idx])))
+
+                scene_data.append({
+                    "seq": current_ppt_idx + 1,
+                    "time": current_time,
+                    "path": save_path,
+                    "filename": save_name,
+                    "ppt_source": ppt_filenames[current_ppt_idx]
+                })
+                status.write(f"✅ PPT {current_ppt_idx+1}번 매칭 성공! ({current_time:.1f}초)")
+
     cap.release()
-    progress_bar.empty()
-    return saved_slides
-
-def create_slide_based_storyboard(script_df, slides):
-    df_slides = pd.DataFrame(slides)
-    df_slides = df_slides.sort_values(by="초")
+    status.empty()
     
-    storyboard_data = []
-    
-    for i in range(len(df_slides)):
-        current_slide = df_slides.iloc[i]
-        start_time = current_slide['초']
+    # 첫 장면(PPT 1번)이 누락될 수 있으므로 강제 추가 (0초)
+    if not scene_data:
+        first_save = os.path.join(OUTPUT_DIR, "match_scene_01.jpg")
+        cv2.imwrite(first_save, first_frame)
+        scene_data.append({"seq": 1, "time": 0.0, "path": first_save, "filename": "match_scene_01.jpg"})
         
-        if i < len(df_slides) - 1:
-            end_time = df_slides.iloc[i+1]['초']
+    return scene_data
+
+
+# [Track 2] 자동 감지 모드 (기존 로직)
+def extract_scenes_auto(video_path, sensitivity, cooldown, mask_dir, w_ratio, h_ratio, progress_bar):
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    duration = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) / fps if fps > 0 else 0
+    
+    prev_frame = None
+    last_capture_time = -cooldown
+    scene_data = [] 
+    scene_count = 0
+    status_text = st.empty()
+
+    while True:
+        ret, frame = cap.read()
+        if not ret: break
+        current_time = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+        
+        if duration > 0 and int(current_time)%2==0:
+            progress_bar.progress(min(int((current_time/duration)*40), 40))
+
+        if current_time - last_capture_time < cooldown: continue
+
+        h, w = frame.shape[:2]
+        mask_w_px = int(w * (w_ratio / 100))
+        mask_h_px = int(h * (h_ratio / 100))
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        analyze_area = gray.copy()
+
+        if mask_dir == "우측 하단": analyze_area[h-mask_h_px:h, w-mask_w_px:w] = 0
+        elif mask_dir == "좌측 하단": analyze_area[h-mask_h_px:h, 0:mask_w_px] = 0
+        elif mask_dir == "우측 상단": analyze_area[0:mask_h_px, w-mask_w_px:w] = 0
+
+        is_changed = False
+        if prev_frame is None: is_changed = True
         else:
-            end_time = 999999 
-            
-        mask = (script_df['시작_초'] >= start_time) & (script_df['시작_초'] < end_time)
-        matched_scripts = script_df[mask]
-        
-        full_text = " ".join(matched_scripts['내용'].tolist())
-        
-        storyboard_data.append({
-            "No": i + 1, 
-            "Time": f"{current_slide['시간']} ~ {time.strftime('%H:%M:%S', time.gmtime(end_time)) if end_time != 999999 else 'End'}",
-            "Script": full_text,
-            "Image": current_slide['파일명'],
-            "AI_Description": "" 
-        })
-        
-    return pd.DataFrame(storyboard_data)
+            diff = np.mean(cv2.absdiff(prev_frame, analyze_area))
+            if diff > sensitivity: is_changed = True
 
-def analyze_image_with_gemini(image_path, api_key):
+        if is_changed:
+            scene_count += 1
+            save_name = f"auto_scene_{scene_count:03d}.jpg"
+            save_path = os.path.join(OUTPUT_DIR, save_name)
+            cv2.imwrite(save_path, frame)
+            scene_data.append({"seq": scene_count, "time": current_time, "path": save_path, "filename": save_name})
+            last_capture_time = current_time
+            prev_frame = analyze_area
+            status_text.write(f"📸 변화 감지: {scene_count}번 장면")
+
+    cap.release()
+    status_text.empty()
+    return scene_data
+
+# ==========================================
+# 3. 공통 유틸리티 (초기화, Whisper, Gemini)
+# ==========================================
+def init_environment():
+    try:
+        for d in [TEMP_DIR, OUTPUT_DIR, PPT_DIR]:
+            if os.path.exists(d): shutil.rmtree(d)
+            os.makedirs(d, exist_ok=True)
+    except: pass
+
+def run_gemini(image_path, api_key):
+    if not api_key: return "API 키 없음"
     try:
         genai.configure(api_key=api_key)
-        # 만약 이것도 안 되면 'gemini-1.5-pro' 로 변경 가능
-        model = genai.GenerativeModel('gemini-1.5-flash') 
-        
-        img = cv2.imread(image_path)
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        from PIL import Image
-        pil_img = Image.fromarray(img)
-        
-        prompt = """
-        이 이미지는 교육 영상의 한 장면(PPT 슬라이드)이야. 
-        이 슬라이드를 나중에 AI 이미지 생성기로 다시 그릴 수 있도록 자세히 묘사해줘.
-        다음 내용을 포함해서 한글로 3문장 이내로 요약해:
-        1. 시각적 요소 (배경 스타일, 그림, 레이아웃)
-        2. 주요 텍스트 내용이나 인용구 (OCR)
-        3. 전체적인 분위기나 상황
-        """
-        
-        response = model.generate_content([prompt, pil_img])
-        return response.text
-    except Exception as e:
-        # 에러 메시지를 좀 더 자세히 출력
-        return f"분석 실패: {str(e)}"
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        img = genai.upload_file(image_path)
+        return model.generate_content(["이 화면 요약", img]).text
+    except Exception as e: return f"Gemini Error: {e}"
 
-def create_zip_file(folder_path):
-    zip_buffer = io.BytesIO()
-    with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
-        for root, dirs, files in os.walk(folder_path):
-            for file in files:
-                file_path = os.path.join(root, file)
-                zip_file.write(file_path, arcname=file)
-    return zip_buffer.getvalue()
+def run_whisper(video_path, api_key):
+    if not api_key: return "API 키 없음"
+    try:
+        if os.path.exists(AUDIO_PATH): os.remove(AUDIO_PATH)
+        clip = VideoFileClip(video_path)
+        clip.audio.write_audiofile(AUDIO_PATH, logger=None)
+        clip.close()
+        
+        from openai import OpenAI
+        client = OpenAI(api_key=api_key)
+        with open(AUDIO_PATH, "rb") as f:
+            return client.audio.transcriptions.create(model="whisper-1", file=f, response_format="text")
+    except Exception as e: return f"Whisper Error: {e}"
 
-# --- 메인 UI ---
-st.title("🎥 AI Video Re-Mastering Studio")
+def draw_mask_preview(frame, direction, w_ratio, h_ratio):
+    preview = frame.copy()
+    h, w = preview.shape[:2]
+    mask_w, mask_h = int(w*(w_ratio/100)), int(h*(h_ratio/100))
+    if direction == "우측 하단": cv2.rectangle(preview, (w-mask_w, h-mask_h), (w, h), (0,0,255), -1)
+    elif direction == "좌측 하단": cv2.rectangle(preview, (0, h-mask_h), (mask_w, h), (0,0,255), -1)
+    elif direction == "우측 상단": cv2.rectangle(preview, (w-mask_w, 0), (w, mask_h), (0,0,255), -1)
+    return preview
+
+# ==========================================
+# 4. 메인 UI
+# ==========================================
+st.set_page_config(page_title="헌수학당 분석기 Final", layout="wide")
+st.title("🎬 헌수학당 콘텐츠 분석기")
 
 with st.sidebar:
-    st.header("1. 파일 입력")
-    video_source = st.file_uploader("강의 영상 업로드", type=['mp4', 'avi', 'mov'])
+    st.header("설정")
+    openai_key = st.text_input("OpenAI Key", type="password")
+    google_key = st.text_input("Gemini Key", type="password")
+    st.divider()
+    
+    st.subheader("모드 설정")
+    # 여기가 핵심입니다! PPT 유무에 따라 전략을 보여줍니다.
+    mode_info = st.empty()
     
     st.divider()
-    st.header("⚙️ 설정 (Settings)")
-    gemini_api_key = st.text_input("💎 Gemini API Key (선택)", type="password", help="키를 입력하면 AI가 이미지를 분석해줍니다.")
+    st.subheader("자동 감지 옵션 (PPT 없을 때만 사용)")
+    sensitivity = st.slider("민감도", 5, 50, 15)
+    cooldown = st.slider("최소 간격", 1.0, 5.0, 2.0)
+    mask_dir = st.selectbox("가릴 위치", ["없음", "우측 하단", "좌측 하단", "우측 상단"])
+    mask_w, mask_h = st.slider("가로 %", 0,50,20), st.slider("세로 %", 0,50,20)
     
-    st.divider()
-    st.subheader("정밀 분석 설정")
-    cut_x_input = st.slider("가로 위치", 0.5, 0.95, 0.75, 0.05)
-    cut_y_input = st.slider("세로 위치", 0.3, 0.9, 0.6, 0.05)
-    sensitivity_input = st.slider("민감도", 1.0, 20.0, 5.0)
-    min_interval_input = st.slider("쿨타임", 1, 60, 5)
+    if st.button("🗑️ 초기화"):
+        st.experimental_rerun()
 
-if video_source:
-    with open("temp_video.mp4", "wb") as f:
-        f.write(video_source.read())
-    
-    st.info("✅ 영상 준비 완료!")
-    
-    tab1, tab2 = st.tabs(["🔍 1단계: 재료 추출", "📝 2단계: 스토리보드"])
-    
-    # --- [탭 1] ---
-    with tab1:
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("🚀 (1) 음성 대본 추출", use_container_width=True):
-                model = load_whisper_model()
-                audio_file = extract_audio("temp_video.mp4")
-                if audio_file:
-                    with st.spinner("듣는 중..."):
-                        segments = analyze_audio(audio_file, model)
-                        data = [{"시작": time.strftime('%H:%M:%S', time.gmtime(s['start'])),
-                                 "시작_초": s['start'], "내용": s['text']} for s in segments]
-                        st.session_state.script_df = pd.DataFrame(data)
-                        st.success("완료!")
-                        scroll_to_bottom() 
-            if st.session_state.script_df is not None:
-                st.dataframe(st.session_state.script_df, height=300)
-
-        with col2:
-            if st.button("🎨 (2) PPT 장면 추출", use_container_width=True):
-                with st.spinner("보는 중..."):
-                    slides = analyze_scenes("temp_video.mp4", cut_x_input, cut_y_input, sensitivity_input, min_interval_input)
-                    if slides:
-                        st.session_state.slides_data = slides
-                        st.success(f"{len(slides)}장 추출 완료!")
-                        scroll_to_bottom() 
-            
-            if st.session_state.slides_data is not None:
-                st.write(f"총 {len(st.session_state.slides_data)}장의 PPT 확보")
-                
-                zip_data = create_zip_file("extracted_slides")
-                st.download_button("📦 모든 이미지 다운로드 (.ZIP)", zip_data, "ppt_slides.zip", "application/zip", type="primary")
-                
-                with st.expander("📸 전체 장면 펼쳐보기"):
-                    cols = st.columns(3)
-                    for idx, slide in enumerate(st.session_state.slides_data):
-                        with cols[idx % 3]:
-                            st.image(slide['파일명'], caption=f"Scene #{idx+1} [{slide['시간']}]", use_container_width=True)
-
-    # --- [탭 2] ---
-    with tab2:
-        st.subheader("📝 장면(Scene) 리스트 & AI 분석")
+col1, col2 = st.columns(2)
+with col1:
+    uploaded_video = st.file_uploader("1. 영상 파일", type=["mp4"])
+    if uploaded_video:
+        if not os.path.exists(TEMP_DIR): os.makedirs(TEMP_DIR)
+        video_path = os.path.join(TEMP_DIR, "input.mp4")
+        with open(video_path, "wb") as f: f.write(uploaded_video.getbuffer())
         
-        if st.session_state.script_df is None or st.session_state.slides_data is None:
-            st.warning("⚠️ 1단계에서 음성과 이미지를 모두 추출해주세요.")
-        else:
-            if st.session_state.storyboard_df is None:
-                st.session_state.storyboard_df = create_slide_based_storyboard(st.session_state.script_df, st.session_state.slides_data)
-            
-            c1, c2 = st.columns([1, 1])
-            with c1:
-                if gemini_api_key:
-                    if st.button("🤖 AI 장면 정밀 분석 시작 (Gemini)", type="primary"):
-                        progress_bar = st.progress(0)
-                        total = len(st.session_state.storyboard_df)
-                        for index, row in st.session_state.storyboard_df.iterrows():
-                            if not row['AI_Description']:
-                                desc = analyze_image_with_gemini(row['Image'], gemini_api_key)
-                                st.session_state.storyboard_df.at[index, 'AI_Description'] = desc
-                            progress_bar.progress((index + 1) / total)
-                        
-                        st.success("분석 완료!")
-                        scroll_to_bottom() 
-                        st.rerun()
-                else:
-                    st.info("💡 사이드바에 Gemini API 키를 넣으면 이미지 분석이 가능합니다.")
+        cap = cv2.VideoCapture(video_path)
+        ret, frame = cap.read()
+        cap.release()
+        if ret:
+            prev_img = draw_mask_preview(frame, mask_dir, mask_w, mask_h)
+            st.image(cv2.cvtColor(prev_img, cv2.COLOR_BGR2RGB), caption="미리보기")
 
-            with c2:
-                csv_sb = st.session_state.storyboard_df.to_csv(index=False).encode('utf-8-sig')
-                st.download_button("💾 전체 리스트 다운로드 (Excel)", csv_sb, 'storyboard_final.csv', 'text/csv', type="primary")
-            
-            st.divider()
-            
-            # [5단 리스트 출력] 
-            for index, row in st.session_state.storyboard_df.iterrows():
-                cols = st.columns([0.4, 0.8, 2.5, 1.5, 1.5])
-                
-                with cols[0]:
-                    st.markdown(f"**#{row['No']}**")
-                
-                with cols[1]:
-                    st.caption(row['Time'])
-                
-                with cols[2]:
-                    st.text_area(f"s_{index}", row['Script'], height=120, label_visibility="collapsed")
-                    
-                with cols[3]:
-                    st.image(row['Image'], use_container_width=True)
-                    
-                with cols[4]:
-                    if row['AI_Description']:
-                        if "분석 실패" in row['AI_Description']:
-                             st.error("Error: 키 확인 필요")
-                             with st.expander("에러 내용 보기"):
-                                 st.write(row['AI_Description'])
-                        else:
-                            st.info(row['AI_Description'])
-                    else:
-                        st.caption("Waiting...")
-                
-                st.markdown("---")
+with col2:
+    uploaded_ppts = st.file_uploader("2. PPT 이미지들 (매칭용)", accept_multiple_files=True)
+    if uploaded_ppts:
+        st.success(f"✅ PPT {len(uploaded_ppts)}장 로드됨! [Track 1: 매칭 모드]로 작동합니다.")
+        mode_info.success("매칭 모드 활성화됨")
+    else:
+        st.info("PPT가 없습니다. [Track 2: 자동 감지 모드]로 작동합니다.")
+        mode_info.info("자동 감지 모드")
+
+st.divider()
+
+if uploaded_video and st.button("🚀 분석 시작", type="primary"):
+    init_environment()
+    progress_bar = st.progress(0)
+    video_path = os.path.join(TEMP_DIR, "input.mp4")
+    # 파일 다시 확보 (초기화 대비)
+    with open(video_path, "wb") as f: f.write(uploaded_video.getbuffer())
+    
+    # === [분기점] PPT가 있냐 없냐에 따라 다른 함수 호출 ===
+    if uploaded_ppts:
+        st.write("🔄 **Track 1 가동:** PPT 이미지를 기준으로 영상을 분석합니다...")
+        scenes = extract_scenes_by_matching(video_path, uploaded_ppts, progress_bar)
+    else:
+        st.write("🎥 **Track 2 가동:** 화면 변화를 감지하여 영상을 분석합니다...")
+        scenes = extract_scenes_auto(video_path, sensitivity, cooldown, mask_dir, mask_w, mask_h, progress_bar)
+    
+    if not scenes:
+        st.error("장면 추출 실패. 설정을 확인하세요.")
+        st.stop()
+        
+    st.success(f"Step 1 완료: {len(scenes)}개 장면")
+    
+    # Step 2: Gemini & Whisper (공통)
+    st.info("AI 분석 시작...")
+    final_data = []
+    for i, s in enumerate(scenes):
+        progress_bar.progress(40 + int((i/len(scenes))*50))
+        desc = run_gemini(s['path'], google_key)
+        final_data.append({"순서": s['seq'], "시간": f"{s['time']:.1f}", "설명": desc, "파일명": s['filename']})
+    
+    full_script = run_whisper(video_path, openai_key)
+    progress_bar.progress(100)
+    
+    # 엑셀 저장
+    df = pd.DataFrame(final_data)
+    excel_path = "result.xlsx"
+    with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
+        df.to_excel(writer, sheet_name='장면', index=False)
+        pd.DataFrame({"스크립트": [full_script]}).to_excel(writer, sheet_name='스크립트', index=False)
+        
+    st.balloons()
+    with open(excel_path, "rb") as f:
+        st.download_button("📥 엑셀 다운로드", f, file_name="헌수학당_완성본.xlsx")
+        
+    # 결과 표시
+    cols = st.columns(3)
+    for i, row in df.iterrows():
+        cols[i%3].image(os.path.join(OUTPUT_DIR, row['파일명']), caption=f"#{row['순서']}")
