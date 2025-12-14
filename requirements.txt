@@ -1,6 +1,9 @@
 streamlit
+opencv-python
 pandas
-openai-whisper
-opencv-python-headless
 moviepy
+openai-whisper
 google-generativeai
+requests
+openpyxl
+numpy
